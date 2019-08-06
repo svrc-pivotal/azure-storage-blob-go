@@ -14,6 +14,8 @@ import (
 	"errors"
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // CommonResponse returns the headers common to all blob REST API responses.
@@ -298,25 +300,26 @@ type batchTransferOptions struct {
 func doBatchTransfer(ctx context.Context, o batchTransferOptions) error {
 	// Prepare and do parallel operations.
 	numChunks := uint16(((o.transferSize - 1) / o.chunkSize) + 1)
-	operationChannel := make(chan func() error, o.parallelism) // Create the channel that release 'parallelism' goroutines concurrently
-	operationResponseChannel := make(chan error, numChunks)    // Holds each response
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	group, _ := errgroup.WithContext(ctx)
 
 	// Create the goroutines that process each operation (in parallel).
 	if o.parallelism == 0 {
 		o.parallelism = 5 // default parallelism
 	}
+	operationChannel := make(chan func() error, o.parallelism) // Create the channel that release 'parallelism' goroutines concurrently
 	for g := uint16(0); g < o.parallelism; g++ {
 		//grIndex := g
-		go func() {
+		group.Go(func() error {
 			for f := range operationChannel {
 				//fmt.Printf("[%s] gr-%d start action\n", o.operationName, grIndex)
 				err := f()
-				operationResponseChannel <- err
+				if err != nil {
+					return err
+				}
 				//fmt.Printf("[%s] gr-%d end action\n", o.operationName, grIndex)
 			}
-		}()
+			return nil
+		})
 	}
 
 	// Add each chunk's operation to the channel.
@@ -333,16 +336,8 @@ func doBatchTransfer(ctx context.Context, o batchTransferOptions) error {
 		}
 	}
 	close(operationChannel)
+	return group.Wait()
 
-	// Wait for the operations to complete.
-	for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
-		responseError := <-operationResponseChannel
-		if responseError != nil {
-			cancel()             // As soon as any operation fails, cancel all remaining operation calls
-			return responseError // No need to process anymore responses
-		}
-	}
-	return nil
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -452,9 +447,7 @@ func (fe *firstErr) get() (err error) {
 }
 
 func uploadStream(ctx context.Context, reader io.Reader, o UploadStreamOptions, t iTransfer) (interface{}, error) {
-	firstErr := firstErr{}
-	ctx, cancel := context.WithCancel(ctx) // New context so that any failure cancels everything
-	defer cancel()
+	group, ctx := errgroup.WithContext(ctx)
 	wg := sync.WaitGroup{} // Used to know when all outgoing messages have finished processing
 	type OutgoingMsg struct {
 		chunkNum uint32
@@ -473,20 +466,18 @@ func uploadStream(ctx context.Context, reader io.Reader, o UploadStreamOptions, 
 		// For each Buffer, create it and a goroutine to upload it
 		incoming <- make([]byte, o.BufferSize) // Add the new buffer to the incoming channel so this goroutine can from the reader into it
 		numBuffers++
-		go func() {
+		group.Go(func() error {
 			for outgoingMsg := range outgoing {
 				// Upload the outgoing buffer
 				err := t.chunk(ctx, outgoingMsg.chunkNum, outgoingMsg.buffer)
 				wg.Done() // Indicate this buffer was sent
 				if nil != err {
-					// NOTE: finalErr could be assigned to multiple times here which is OK,
-					// some error will be returned.
-					firstErr.set(err)
-					cancel()
+					return err
 				}
 				incoming <- outgoingMsg.buffer // The goroutine reading from the stream can reuse this buffer now
 			}
-		}()
+			return nil
+		})
 	}
 	injectBuffer() // Create our 1st buffer & outgoing goroutine
 
@@ -520,16 +511,14 @@ func uploadStream(ctx context.Context, reader io.Reader, o UploadStreamOptions, 
 		if err != nil { // The reader is done, no more outgoing buffers
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				err = nil // This function does NOT return an error if io.ReadFull returns io.EOF or io.ErrUnexpectedEOF
-			} else {
-				firstErr.set(err)
 			}
 			break
 		}
 	}
 	// NOTE: Don't close the incoming channel because the outgoing goroutines post buffers into it when they are done
-	close(outgoing) // Make all the outgoing goroutines terminate when this channel is empty
-	wg.Wait()       // Wait for all pending outgoing messages to complete
-	err := firstErr.get()
+	close(outgoing)     // Make all the outgoing goroutines terminate when this channel is empty
+	wg.Wait()           // Wait for all pending outgoing messages to complete
+	err := group.Wait() // Wait for all pending goroutines to complete
 	if err == nil {
 		// If no error, after all blocks uploaded, commit them to the blob & return the result
 		return t.end(ctx)
