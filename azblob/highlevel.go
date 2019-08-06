@@ -14,6 +14,8 @@ import (
 	"errors"
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // CommonResponse returns the headers common to all blob REST API responses.
@@ -298,25 +300,26 @@ type batchTransferOptions struct {
 func doBatchTransfer(ctx context.Context, o batchTransferOptions) error {
 	// Prepare and do parallel operations.
 	numChunks := uint16(((o.transferSize - 1) / o.chunkSize) + 1)
-	operationChannel := make(chan func() error, o.parallelism) // Create the channel that release 'parallelism' goroutines concurrently
-	operationResponseChannel := make(chan error, numChunks)    // Holds each response
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	group, _ := errgroup.WithContext(ctx)
 
 	// Create the goroutines that process each operation (in parallel).
 	if o.parallelism == 0 {
 		o.parallelism = 5 // default parallelism
 	}
+	operationChannel := make(chan func() error, o.parallelism) // Create the channel that release 'parallelism' goroutines concurrently
 	for g := uint16(0); g < o.parallelism; g++ {
 		//grIndex := g
-		go func() {
+		group.Go(func() error {
 			for f := range operationChannel {
 				//fmt.Printf("[%s] gr-%d start action\n", o.operationName, grIndex)
 				err := f()
-				operationResponseChannel <- err
+				if err != nil {
+					return err
+				}
 				//fmt.Printf("[%s] gr-%d end action\n", o.operationName, grIndex)
 			}
-		}()
+			return nil
+		})
 	}
 
 	// Add each chunk's operation to the channel.
@@ -333,16 +336,8 @@ func doBatchTransfer(ctx context.Context, o batchTransferOptions) error {
 		}
 	}
 	close(operationChannel)
+	return group.Wait()
 
-	// Wait for the operations to complete.
-	for chunkNum := uint16(0); chunkNum < numChunks; chunkNum++ {
-		responseError := <-operationResponseChannel
-		if responseError != nil {
-			cancel()             // As soon as any operation fails, cancel all remaining operation calls
-			return responseError // No need to process anymore responses
-		}
-	}
-	return nil
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
